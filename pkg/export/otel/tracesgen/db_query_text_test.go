@@ -23,6 +23,12 @@ func queryTextSpans() []request.Span {
 		{Type: request.EventTypeSQLClient, SubType: int(request.DBMSSQL), Method: "SELECT", Statement: "SELECT [a] FROM t WHERE id = @p1"},
 		{Type: request.EventTypeHTTPClient, SubType: request.HTTPSubtypeSQLPP, Method: "SELECT", Statement: `SELECT * FROM b WHERE type = "airline"`},
 		{Type: request.EventTypeRedisClient, Method: "SET", Path: "SET key 1", DBQueryTextSanitized: "SET key ?"},
+		{
+			Type:                 request.EventTypeCouchbaseClient,
+			Method:               "SET",
+			Statement:            `SET user::42 TTL=3600 {"card":"4111111111111111"}`,
+			DBQueryTextSanitized: "SET user::42 TTL=3600 ?",
+		},
 	}
 }
 
@@ -72,6 +78,7 @@ func TestDBQueryTextSanitized(t *testing.T) {
 		"SELECT [a] FROM t WHERE id = @p1",
 		"SELECT * FROM b WHERE type = ?",
 		"SET key ?",
+		"SET user::42 TTL=3600 ?",
 	}
 
 	assert.ElementsMatch(t, want, groupedQueryTexts(t, true))

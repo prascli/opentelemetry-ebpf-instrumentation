@@ -1112,3 +1112,87 @@ func TestProcessCouchbaseEvent_StatementPopulated(t *testing.T) {
 	require.NotNil(t, info)
 	assert.Equal(t, "GET user::42", info.Statement)
 }
+
+func TestSanitizeCouchbaseStatement(t *testing.T) {
+	setExtras := func(flags, ttl uint32) []byte {
+		b := make([]byte, 8)
+		binary.BigEndian.PutUint32(b[0:4], flags)
+		binary.BigEndian.PutUint32(b[4:8], ttl)
+		return b
+	}
+	incrExtras := func(delta, initial uint64, ttl uint32) []byte {
+		b := make([]byte, 20)
+		binary.BigEndian.PutUint64(b[0:8], delta)
+		binary.BigEndian.PutUint64(b[8:16], initial)
+		binary.BigEndian.PutUint32(b[16:20], ttl)
+		return b
+	}
+
+	tests := []struct {
+		name     string
+		opcode   couchbasekv.Opcode
+		key      string
+		value    []byte
+		extras   []byte
+		dataType couchbasekv.DataType
+		want     string
+	}{
+		{
+			name:     "SET with TTL masks the document value",
+			opcode:   couchbasekv.OpcodeSet,
+			key:      "user::42",
+			value:    []byte(`{"card":"4111111111111111"}`),
+			extras:   setExtras(0, 3600),
+			dataType: couchbasekv.DataTypeJSON,
+			want:     "SET user::42 TTL=3600 ?",
+		},
+		{
+			name:     "APPEND masks the document value",
+			opcode:   couchbasekv.OpcodeAppend,
+			key:      "user::42",
+			value:    []byte(`,"note":"secret"`),
+			dataType: couchbasekv.DataTypeRaw,
+			want:     "APPEND user::42 ?",
+		},
+		{
+			name:     "GET stays key-only",
+			opcode:   couchbasekv.OpcodeGet,
+			key:      "user::42",
+			dataType: couchbasekv.DataTypeRaw,
+			want:     "GET user::42",
+		},
+		{
+			name:     "DELETE stays key-only",
+			opcode:   couchbasekv.OpcodeDelete,
+			key:      "user::42",
+			dataType: couchbasekv.DataTypeRaw,
+			want:     "DELETE user::42",
+		},
+		{
+			name:     "INCREMENT keeps DELTA and TTL",
+			opcode:   couchbasekv.OpcodeIncrement,
+			key:      "counter::x",
+			extras:   incrExtras(5, 0, 60),
+			dataType: couchbasekv.DataTypeRaw,
+			want:     "INCREMENT counter::x DELTA=5 TTL=60",
+		},
+		{
+			name:     "snappy value is already omitted",
+			opcode:   couchbasekv.OpcodeSet,
+			key:      "user::42",
+			value:    []byte{0xff, 0x01},
+			extras:   setExtras(0, 3600),
+			dataType: couchbasekv.DataTypeJSON | couchbasekv.DataTypeSnappy,
+			want:     "SET user::42 TTL=3600",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := makeCouchbaseRequestPacketWithDataType(tt.opcode, tt.key, tt.value, tt.extras, tt.dataType)
+			pkt, err := couchbasekv.ParsePacket(raw)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, sanitizeCouchbaseStatement(pkt, false))
+		})
+	}
+}

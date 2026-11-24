@@ -28,11 +28,16 @@ type CouchbaseInfo struct {
 	Scope      string
 	Collection string
 	Statement  string
-	Status     couchbasekv.Status
-	IsError    bool
+	// SanitizedStatement is db.query.text with the document value replaced by
+	// "?", for use when sanitize_query_text is enabled.
+	SanitizedStatement string
+	Status             couchbasekv.Status
+	IsError            bool
 }
 
 var errInvalidCouchbase = errors.New("no valid Couchbase request packets found")
+
+const couchbaseSanitizedValue = "?"
 
 // buildCouchbaseStatement builds a db.query.text string for a KV request packet.
 // See devdocs/protocols/tcp/couchbase.md for the full format specification.
@@ -42,6 +47,16 @@ var errInvalidCouchbase = errors.New("no valid Couchbase request packets found")
 // best-effort even when collectionsEnabled is false, to handle connections
 // established before OBI started monitoring.
 func buildCouchbaseStatement(pkt couchbasekv.Packet, collectionsEnabled bool) string {
+	return buildCouchbaseStatementWithOptions(pkt, collectionsEnabled, false)
+}
+
+// sanitizeCouchbaseStatement builds the same text with document values masked.
+// Operation, key and extras (TTL, DELTA) are preserved.
+func sanitizeCouchbaseStatement(pkt couchbasekv.Packet, collectionsEnabled bool) string {
+	return buildCouchbaseStatementWithOptions(pkt, collectionsEnabled, true)
+}
+
+func buildCouchbaseStatementWithOptions(pkt couchbasekv.Packet, collectionsEnabled, maskValue bool) string {
 	op := pkt.Header().Opcode()
 	keyBytes := pkt.Key()
 	if collectionsEnabled {
@@ -61,10 +76,10 @@ func buildCouchbaseStatement(pkt couchbasekv.Packet, collectionsEnabled bool) st
 	switch op {
 	case couchbasekv.OpcodeSet, couchbasekv.OpcodeAdd, couchbasekv.OpcodeReplace,
 		couchbasekv.OpcodeSetQ, couchbasekv.OpcodeAddQ, couchbasekv.OpcodeReplaceQ:
-		appendMutationExtras(&b, pkt)
+		appendMutationExtras(&b, pkt, maskValue)
 	case couchbasekv.OpcodeAppend, couchbasekv.OpcodePrepend,
 		couchbasekv.OpcodeAppendQ, couchbasekv.OpcodePrependQ:
-		appendValue(&b, pkt)
+		appendValue(&b, pkt, maskValue)
 	case couchbasekv.OpcodeIncrement, couchbasekv.OpcodeDecrement,
 		couchbasekv.OpcodeIncrementQ, couchbasekv.OpcodeDecrementQ:
 		appendCounterExtras(&b, pkt)
@@ -75,13 +90,13 @@ func buildCouchbaseStatement(pkt couchbasekv.Packet, collectionsEnabled bool) st
 	return b.String()
 }
 
-func appendMutationExtras(b *strings.Builder, pkt couchbasekv.Packet) {
+func appendMutationExtras(b *strings.Builder, pkt couchbasekv.Packet, maskValue bool) {
 	if extras := pkt.Extras(); len(extras) >= 8 {
 		if ttl := binary.BigEndian.Uint32(extras[4:8]); ttl != 0 {
 			appendUint32Tag(b, "TTL", ttl)
 		}
 	}
-	appendValue(b, pkt)
+	appendValue(b, pkt, maskValue)
 }
 
 func appendCounterExtras(b *strings.Builder, pkt couchbasekv.Packet) {
@@ -112,10 +127,14 @@ func appendUint32Tag(b *strings.Builder, name string, val uint32) {
 	b.WriteString(strconv.FormatUint(uint64(val), 10))
 }
 
-func appendValue(b *strings.Builder, pkt couchbasekv.Packet) {
+func appendValue(b *strings.Builder, pkt couchbasekv.Packet, maskValue bool) {
 	if val := couchbaseValueForStatement(pkt); val != "" {
 		b.WriteByte(' ')
-		b.WriteString(val)
+		if maskValue {
+			b.WriteString(couchbaseSanitizedValue)
+		} else {
+			b.WriteString(val)
+		}
 	}
 }
 
@@ -291,6 +310,7 @@ func processCouchbaseEvent(connInfo BpfConnectionInfoT, requestBuf []byte, respo
 		}
 
 		info.Statement = buildCouchbaseStatement(reqPacket, collectionsEnabled)
+		info.SanitizedStatement = sanitizeCouchbaseStatement(reqPacket, collectionsEnabled)
 
 		if hasResp && respPacket.IsResponse() {
 			info.Status = respPacket.Header().Status()
@@ -360,8 +380,9 @@ func TCPToCouchbaseToSpan(trace *TCPRequestInfo, data *CouchbaseInfo) request.Sp
 			UserPID:   app.PID(trace.Pid.UserPid),
 			Namespace: trace.Pid.Ns,
 		},
-		DBError:     dbError,
-		DBNamespace: dbNamespace,
-		Statement:   data.Statement,
+		DBError:              dbError,
+		DBNamespace:          dbNamespace,
+		Statement:            data.Statement,
+		DBQueryTextSanitized: data.SanitizedStatement,
 	}
 }
